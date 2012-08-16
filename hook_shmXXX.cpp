@@ -57,6 +57,9 @@
 #include <stdlib.h>
 #include <bfd.h>
 #include <map>
+#include <errno.h>
+#include <execinfo.h>
+
 
 #if defined(RTLD_NEXT)
 #define REAL_LIBC RTLD_NEXT
@@ -111,7 +114,7 @@ static void close_log(){
 static bfd * abfd = NULL;
 static asymbol ** syms = NULL;
 static int symnum;
-static map<long, asymbol *> addr2Sym;
+static map<long, long> addr2Sym;
 
 //関数情報出力準備
 void setup_symbols(){
@@ -140,7 +143,7 @@ void setup_symbols(){
   for( i = 0; i < symnum; i++ ){
     sym = syms[i];
     value = bfd_asymbol_value(sym);
-    addr2Sym[value] = sym;
+    addr2Sym.insert( map<long, long>::value_type( value, (long)sym) );
   }
 }
 
@@ -159,7 +162,6 @@ void close_symbols(){
 }
 
 void show_debug_info( void * addr ){
-  
 /*
   Dl_info info;
   
@@ -181,9 +183,14 @@ void show_debug_info( void * addr ){
   }
 */
 
-//debug情報から関数がコールされているファイル名と行数を取得
+  //debug情報から関数がコールされているファイル名と行数を取得
   asection * dbgsec = bfd_get_section_by_name(abfd, ".debug_info");
-  
+
+  if( NULL == dbgsec ){
+    cout << "0x" << addr << ":" << "???@???:???";
+    return;
+  }
+
   const char * file_name;
   const char * function_name;
   unsigned int line;
@@ -192,7 +199,7 @@ void show_debug_info( void * addr ){
 				    &file_name,
 				    &function_name,
 				    &line);
-  
+
   int status = 0;
   char * demangled = NULL;
   
@@ -202,10 +209,8 @@ void show_debug_info( void * addr ){
     demangled = abi::__cxa_demangle(function_name, 0, 0, &status);
     cout << "0x" << addr << ":" << demangled << "@" << file_name << ":" << line << endl;
   }else{
-    //デバッグ情報読み込み失敗したので、関数名だけ頑張って取得
-    map<long, asymbol *> addr2Sym;
-    
-    asymbol * sym = addr2Sym[addr];
+    //デバッグ情報読み込み失敗したので、関数名だけ頑張って取得    
+    asymbol * sym = (asymbol *)addr2Sym[(long)addr];
     if( NULL == sym ){
       cout << "0x" << addr << ":???" << "@" << "???:???" << endl;
     }else{
@@ -222,18 +227,75 @@ void show_debug_info( void * addr ){
   return;
 }
 
-//backtrace出力のための設定
-typedef struct layout {
-  struct layout *ebp;
-  void *ret;
-} layout;
+//関数名をデマングルして出力
+// ./hook_shmXXX.so(_Z15print_backtracev+0x56) [0xa0001d]
+void print_demangled_bt( const char * str ){
+  if( NULL == str ){
+    return;
+  }
+
+  string name = str;
+
+  //関数名抜きだし
+  string::size_type left = name.find("(");
+  string::size_type right= name.find("+", left + 1);
+
+  string func;
+  string bin;
+  if( left == name.npos || right == name.npos ){
+    func == "";
+    //backtrace情報が想定外だったら諦めてそのまま出力
+    LOGGER << "  nBT  " << str << endl;
+    return;
+  }else{
+    bin  = name.substr( 0, left );
+    func = name.substr( left + 1, right - left - 1 );    
+    cout << func << endl;
+  }
+
+
+  int status;
+  char * demangled = abi::__cxa_demangle(func.c_str(), 0, 0, &status);
+
+  if( NULL != demangled ){
+    LOGGER << "  BT  " << bin << ":" << demangled;
+    free(demangled);
+  }else{
+    LOGGER << "  nBT " << str << endl;
+    return;
+  }
+
+  //関数アドレス情報抜きだし
+  left = name.find("[");
+  right= name.find("]", left + 1);
+
+  string addr;
+  if( left == name.npos || right == name.npos ){
+    LOGGER << endl;
+    return;
+  }else{
+    addr = name.substr( left + 1, right - left - 1 );
+    LOGGER << " [" << addr << "]" << endl;
+  }
+  return;
+}
 
 void print_backtrace(){
-  layout *ebp = (layout*) __builtin_frame_address(0);
-  while(ebp){
-    show_debug_info( ebp->ret );
-    ebp =ebp->ebp;
+  cout << "print_backtrace()" << endl;
+  void *trace[1024];
+  int n = backtrace(trace, sizeof(trace)/sizeof(trace[0]));
+
+  char ** traceStrings = backtrace_symbols(trace, n);
+
+  if( NULL == traceStrings ){
+    cout << "not found bt" << endl;
+    return;
   }
+
+  for(int i = 0; i < n; i++){
+    print_demangled_bt(traceStrings[i]);
+  }
+  free(traceStrings);
 }
 
 static void __attribute__ ((constructor))
@@ -247,9 +309,9 @@ _constructor()
   
   //元の関数ポインタを取得しておく
   original_shmget = (int(*)(key_t key, size_t size, int shmflg)) dlsym(REAL_LIBC, "shmget" );
-  original_shmat =  ((void *)(*)(int shmid, const void *shmaddr, int shmflg)) dlsym(REAL_LIBC, "shmat");
   original_shmdt =  (int(*)(const void *shmaddr)) dlsym(REAL_LIBC, "shmdt" );
   original_shmctl = (int(*)(int shmid, int cmd, struct shmid_ds *buf)) dlsym(REAL_LIBC, "shmctl");
+  original_shmat =  (void *(*)(int shmid, const void *shmaddr, int shmflg)) dlsym(REAL_LIBC, "shmat");
   return;
 }
 
@@ -265,88 +327,87 @@ _destructor()
 int shmget(key_t key, size_t size, int shmflg)
 {
   // 元の関数を呼び出す
-int ret = (*original_shmget)(key, size, shmflg);
+  int ret = (*original_shmget)(key, size, shmflg);
 
-// errnoの保存
-int org_errno = errno;
-
-LOGGER << "==== call shmget ====" << endl;
-LOGGER << " key = " << key << "@";
-LOGGER << " size = " << size << "@";
-LOGGER << " shmflg = " << shmflg << endl;
-
-//backtrace出力
-print_backtrace();
-
-LOGGER << "==== end shmget ====" << endl;
-
-// errnoの復旧
-org_errno = errno;
-
-return ret;
+  // errnoの保存
+  int org_errno = errno;
+  
+  LOGGER << "==== call shmget ====" << endl;
+  LOGGER << " key = " << key << " @";
+  LOGGER << " size = " << size << " @";
+  LOGGER << " shmflg = " << shmflg << endl;
+  
+  //backtrace出力
+  print_backtrace();
+  
+  LOGGER << "---- end shmget ----" << endl;
+  
+  // errnoの復旧
+  org_errno = errno;
+  
+  return ret;
 }
 
-int shmat(int shmid, const void *shmaddr, int shmflg){
-int ret = (*original_shmat)(shmid, shmaddr, shmflg);
-
-// errnoの保存
-int org_errno = errno;
-
-LOGGER << "==== call shmat ====" << endl;
-LOGGER << " shmid = " << shmid << "@";
-LOGGER << " shmaddr = " << shmaddr << "@";
-LOGGER << " shmflg = " << shmflg << endl;
-
-//backtrace出力
-print_backtrace();
-
-LOGGER << "==== end shmat ====" << endl;
-
-// errnoの復旧
-org_errno = errno;
-
-return ret;
+void * shmat(int shmid, const void * shmaddr, int shmflg){
+  void * ret = (*original_shmat)(shmid, shmaddr, shmflg);
+  
+  // errnoの保存
+  int org_errno = errno;
+  
+  LOGGER << "==== call shmat ====" << endl;
+  LOGGER << " shmid = " << shmid << " @";
+  LOGGER << " shmaddr = " << shmaddr << " @";
+  LOGGER << " shmflg = " << shmflg << endl;
+  
+  //backtrace出力
+  print_backtrace();
+  
+  LOGGER << "---- end shmat ----" << endl;
+  
+  // errnoの復旧
+  org_errno = errno;
+  
+  return ret;
 }
-
 
 int shmdt(const void *shmaddr){
-int ret = (*original_shmdt)(shmaddr);
-
-// errnoの保存
-int org_errno = errno;
-
-LOGGER << "==== call shmdt ====" << endl;
-LOGGER << " shmaddr = " << shmaddr << "@";
-
-//backtrace出力
-print_backtrace();
-
-LOGGER << "==== end shmdt ====" << endl;
-
-// errnoの復旧
-org_errno = errno;
-
-return ret;
+  int ret = (*original_shmdt)(shmaddr);
+  
+  // errnoの保存
+  int org_errno = errno;
+  
+  LOGGER << "==== call shmdt ====" << endl;
+  LOGGER << " shmaddr = " << shmaddr << endl;
+  
+  //backtrace出力
+  print_backtrace();
+  
+  LOGGER << "---- end shmdt ----" << endl;
+  
+  // errnoの復旧
+  org_errno = errno;
+  
+  return ret;
 }
 
 int shmctl(int shmid, int cmd, struct shmid_ds *buf){
-int ret = (*original_shmctl)(shmid, cmd, buf);
+  int ret = (*original_shmctl)(shmid, cmd, buf);
+  
+  // errnoの保存
+  int org_errno = errno;
+  
+  LOGGER << "==== call shmctl ====" << endl;
+  LOGGER << " shmid = " << shmid << " @";
+  LOGGER << " cmd = " << cmd << " @";
+  LOGGER << " buf = " << buf << endl;
+  
+  //backtrace出力
+  print_backtrace();
+  
+  LOGGER << "---- end shmctl ----" << endl;
+  
+  // errnoの復旧
+  org_errno = errno;
 
-// errnoの保存
-int org_errno = errno;
-
-LOGGER << "==== call shmctl ====" << endl;
-LOGGER << " shmid = " << shmid << "@";
-LOGGER << " cmd = " << cmd << "@";
-LOGGER << " buf = " << buf << "@";
-
-//backtrace出力
-print_backtrace();
-
-LOGGER << "==== end shmctl ====" << endl;
-
-// errnoの復旧
-org_errno = errno;
-
-return ret;
+  return ret;
 }
