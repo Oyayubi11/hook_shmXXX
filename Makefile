@@ -9,8 +9,8 @@ OBJS    = hook_shmXXX.o sample.o
 all:    $(TARGET)
 
 $(TARGET): sample.cpp
-	$(CC) -o libhookShm.so -shared -fPIC -lbfd hook_shmXXX.cpp
-	$(CC) -o $@ -L./ -lhookShm sample.cpp
+	$(CC) -o libhookShm.so -shared -fPIC -lbfd -ldl Lib_hook.cpp hook_shmXXX.cpp
+	$(CC) -o $@ sample.cpp
 
 .cpp.o:
 	$(CC) -c $<
