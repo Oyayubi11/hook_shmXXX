@@ -8,6 +8,7 @@
 
 #include <errno.h>
 #include <execinfo.h>
+#include <assert.h>
 
 using namespace std;
 
@@ -34,12 +35,16 @@ Lib_hook::~Lib_hook(){
 void Lib_hook::setup_log(){
   ostringstream os;
 
-  char buf[256];
-  char fullpath[1024];
+  const int BUF_SIZE = 0xFFFF;
+  char buf[BUF_SIZE];
+  char fullpath[BUF_SIZE];
 
+  //実行バイナリのPID取得
   pid_t pid = getpid();
-  sprintf(buf, "/proc/%d/exe", pid );
-  int ret = readlink(buf, fullpath, 1024);
+  snprintf(buf, BUF_SIZE, "/proc/%d/exe", pid );
+  // /proc/xxx/exeは実行バイナリのシンボリックリンクなので
+  // シンボリックリンクの宛先をbufに格納する。
+  int ret = readlink(buf, fullpath, BUF_SIZE);
 
   if( -1 == ret ){
     return;
@@ -68,9 +73,14 @@ void Lib_hook::setup_symbols(){
   int ret;
 
   abfd = bfd_openr(LOG_NAME.c_str(), NULL);
+  assert( abfd );
+
   ret = bfd_check_format(abfd, bfd_object);
+  assert( ret );
 
   if(!(bfd_get_file_flags(abfd) & HAS_SYMS)){
+    //bfd読み込み失敗なので終了
+    assert( bfd_get_error() == bfd_error_no_error );
     bfd_close(abfd);
     return;
   }
@@ -92,6 +102,15 @@ void Lib_hook::setup_symbols(){
   }
 }
 
+const char * Lib_hook::symbol2name( void * addr ){
+  if( NULL == addr ){
+    return NULL;
+  }else{
+    asymbol * sym = (asymbol *)addr2Sym[(long)addr];
+    return bfd_asymbol_name(sym);
+  }
+}
+
 void Lib_hook::close_symbols(){
   if( NULL != syms ){
     free(syms);
@@ -107,24 +126,25 @@ void Lib_hook::close_symbols(){
 }
 
 void Lib_hook::show_debug_info( void * addr ){
-  cout << "DBG_INF:";
   Dl_info info;                                                                             
 
+  //とりあえずdllから引っ張ってみる
+  //dll照会失敗したらbfd使う
   if( !dladdr(addr, &info) ){ 
     goto GET_DEBUG_INFO;
   }
   
   //Name of nearest symbol with address lower than addr
-  if( !info.dli_sname ){
+  //dll名無いときはbfd使う
+  if( !info.dli_sname || !info.dli_saddr ){
     goto GET_DEBUG_INFO;
   }
 
-  //Exact address of symbol named in dli_sname
-  if( !info.dli_saddr ){
-    cout << "0x" << addr << "@" << info.dli_fname << ":" << info.dli_sname << endl;
-  }
+  //ここまでくればdllから情報抜き出し成功
+  cout << "0x" << addr << "@" << info.dli_fname << ":" << info.dli_sname << endl;
+  return;
 
-  //debug情報から関数がコールされているファイル名と行数を取得
+  //bfd使ってdebug情報から関数がコールされているファイル名と行数を取得
 GET_DEBUG_INFO:
   asection * dbgsec = bfd_get_section_by_name(abfd, ".debug_info");
 
@@ -135,39 +155,33 @@ GET_DEBUG_INFO:
 
   const char * file_name;
   const char * function_name;
-  unsigned int line;
-  int found = bfd_find_nearest_line(abfd, dbgsec, syms,
+  char * demangled;
+
+  unsigned int line = 0;
+  int found = bfd_find_nearest_line(abfd,
+				    dbgsec, 
+				    syms,
                                     (long)addr,
                                     &file_name,
                                     &function_name,
                                     &line);
   int status = 0;
-  char * demangled = NULL;
 
-  //読み込み成功
-  if( found && NULL != file_name && NULL != function_name ){
-    //デマングル demangledはmallocされたアドレスが入るので後でfreeすること
-    demangled = abi::__cxa_demangle(function_name, 0, 0, &status);
-    cout << "0x" << addr << ":" << demangled << "@" << file_name << ":" << line << endl;
-  }else{
-    //デバッグ情報読み込み失敗したので、関数名だけ頑張って取得
-    asymbol * sym = (asymbol *)addr2Sym[(long)addr];
-    if( NULL == sym ){
-      cout << "0x" << addr << ":???" << "@" << "???:???" << endl;
-    }else{
-      function_name = bfd_asymbol_name(sym);
-      demangled = abi::__cxa_demangle(function_name, 0, 0, &status);
-      cout << "0x" << addr << ":" << demangled << "@" << "???:???" << endl;
-    }
-  }
+  if( !found || NULL == file_name ) file_name = "???";
 
+  //関数取得できなかったときはシンボル情報から頑張って探す
+  if( !found || NULL == function_name ) function_name = symbol2name(addr);
+  if( NULL == function_name ) function_name = "???";
+  
+  //デマングル demangledはmallocされたアドレスが入るので後でfreeすること
+  demangled = abi::__cxa_demangle(function_name, 0, 0, &status);
+  cout << "0x" << addr << ":" << demangled << "@" << file_name << ":" << line << endl;
   if( demangled ){
     free( demangled );
-  }
+  }    
 
   return;
 }
-
 
 //関数名をデマングルして出力  
 // ./hook_shmXXX.so(_Z15print_backtracev+0x56) [0xa0001d]
@@ -254,8 +268,8 @@ int Lib_hook::shmget(key_t key, size_t size, int shmflg){
   int org_errno = errno;
 
   LOGGER << "==== call shmget ====" << endl;
-  LOGGER << " key = " << key << " @";
-  LOGGER << " size = " << size << " @";
+  LOGGER << " key    = " << key << " @";
+  LOGGER << " size   = " << size << " @";
   LOGGER << " shmflg = " << shmflg << endl;
 
   //backtrace出力                                                                                       
@@ -276,9 +290,9 @@ void * Lib_hook::shmat(int shmid, const void * shmaddr, int shmflg){
   int org_errno = errno;
 
   LOGGER << "==== call shmat ====" << endl;
-  LOGGER << " shmid = " << shmid << " @";
+  LOGGER << " shmid   = " << shmid << " @";
   LOGGER << " shmaddr = " << shmaddr << " @";
-  LOGGER << " shmflg = " << shmflg << endl;
+  LOGGER << " shmflg  = " << shmflg << endl;
 
   //backtrace出力                                                                                       
   print_backtrace();
@@ -319,8 +333,8 @@ int Lib_hook::shmctl(int shmid, int cmd, struct shmid_ds *buf){
 
   LOGGER << "==== call shmctl ====" << endl;
   LOGGER << " shmid = " << shmid << " @";
-  LOGGER << " cmd = " << cmd << " @";
-  LOGGER << " buf = " << buf << endl;
+  LOGGER << " cmd   = " << cmd << " @";
+  LOGGER << " buf   = " << buf << endl;
 
   //backtrace出力                                                                                       
   print_backtrace();

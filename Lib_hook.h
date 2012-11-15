@@ -31,7 +31,7 @@ private:
   void * (*original_shmat) (int shmid, const void *shmaddr, int shmflg);
   int (*original_shmdt) (const void *shmaddr);
   int (*original_shmctl)(int shmid, int cmd, struct shmid_ds *buf);
-
+  
   //ログ出力用ostream;
   std::ofstream LOGGER;
 
@@ -51,9 +51,11 @@ public:
   void close_log();
   void setup_symbols();
   void close_symbols();
+  const char * symbol2name( void * addr );
   void show_debug_info( void * addr );
   void print_demangled_bt( const char * str );
   void print_backtrace();
+
 
   int shmget(key_t key, size_t size, int shmflg);
   void * shmat(int shmid, const void * shmaddr, int shmflg);
